@@ -58,3 +58,11 @@ jobs:
                   assert mid.tracks, f"empty MIDI: {name}"
               print(f"OK: {len(names)} ZIP files; all WAV stems have {next(iter(wav_sizes))} frames.")
           PY
+
+      - name: Upload smoke-test sample ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracks-generator-demo-${{ github.run_number }}
+          path: smoke-output/tracks-generator.zip
+          if-no-files-found: error
+          retention-days: 14
