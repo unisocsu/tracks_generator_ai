@@ -1,0 +1,127 @@
+name: Generate Tracks Pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Describe the accompaniment style and mood"
+        required: true
+        type: string
+        default: "Upbeat pop keyboard accompaniment, warm bass, punchy drums, bright chords"
+      bpm:
+        description: "Tempo in BPM (45-220)"
+        required: true
+        type: number
+        default: 110
+      bars:
+        description: "Number of bars to generate"
+        required: true
+        type: choice
+        options:
+          - "4"
+          - "8"
+          - "16"
+        default: "4"
+      seed:
+        description: "Random seed for reproducible synthesis"
+        required: true
+        type: number
+        default: 42
+      lyria_preview:
+        description: "Also generate an AI music preview with Lyria 3 Clip (requires GEMINI_API_KEY)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracks-generator-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Generate WAV stems, MIDI and ZIP
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Generate tracks
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TRACKS_PROMPT: ${{ inputs.prompt }}
+          TRACKS_BPM: ${{ inputs.bpm }}
+          TRACKS_BARS: ${{ inputs.bars }}
+          TRACKS_SEED: ${{ inputs.seed }}
+          TRACKS_LYRIA_PREVIEW: ${{ inputs.lyria_preview }}
+        run: |
+          python scripts/generate_tracks.py \
+            --prompt "$TRACKS_PROMPT" \
+            --bpm "$TRACKS_BPM" \
+            --bars "$TRACKS_BARS" \
+            --seed "$TRACKS_SEED" \
+            --output output \
+            $( [ "$TRACKS_LYRIA_PREVIEW" = "true" ] && printf '%s' '--lyria' )
+
+      - name: Validate generated package
+        run: |
+          python - <<'PY'
+          import json
+          import wave
+          import zipfile
+          from pathlib import Path
+
+          root = Path("output")
+          package = root / "tracks-generator.zip"
+          assert package.is_file(), "ZIP was not created"
+          with zipfile.ZipFile(package) as zf:
+              names = set(zf.namelist())
+              for required in (
+                  "manifest.json", "arrangement.json", "preview.wav",
+                  "audio/drums.wav", "audio/bass.wav", "audio/chords.wav",
+                  "audio/melody.wav", "audio/pad.wav",
+                  "midi/drums.mid", "midi/bass.mid", "midi/chords.mid",
+                  "midi/melody.mid", "midi/pad.mid",
+              ):
+                  assert required in names, f"Missing in ZIP: {required}"
+              manifest = json.loads(zf.read("manifest.json"))
+              assert manifest["format"] == "ARRSTYLE"
+              wave_info = []
+              for name in sorted(n for n in names if n.startswith("audio/") and n.endswith(".wav")):
+                  import io
+                  with wave.open(io.BytesIO(zf.read(name)), "rb") as w:
+                      wave_info.append((name, w.getnframes(), w.getframerate(), w.getnchannels()))
+              assert wave_info, "No WAV stems found"
+              lengths = {frames for _, frames, _, _ in wave_info}
+              assert len(lengths) == 1, f"WAV stems do not have the same length: {wave_info}"
+              print(f"Validated {len(names)} files; WAV stems share {next(iter(lengths))} frames.")
+          PY
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracks-generator-${{ github.run_number }}
+          path: output/tracks-generator.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload unpacked output (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracks-generator-files-${{ github.run_number }}
+          path: output/package/
+          if-no-files-found: error
+          retention-days: 14
