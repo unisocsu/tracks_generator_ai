@@ -1,0 +1,60 @@
+name: Smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Generate offline sample
+        env:
+          TRACKS_PROMPT: "Upbeat pop keyboard accompaniment"
+        run: |
+          env -u GEMINI_API_KEY python scripts/generate_tracks.py --bpm 110 --bars 4 --seed 42 --output smoke-output
+      - name: Verify ZIP, WAV durations, MIDI and manifest
+        run: |
+          python - <<'PY'
+          import io, json, wave, zipfile
+          from pathlib import Path
+          import mido
+
+          archive = Path("smoke-output/tracks-generator.zip")
+          assert archive.is_file(), "ZIP not generated"
+          with zipfile.ZipFile(archive) as zf:
+              names = set(zf.namelist())
+              required = {
+                  "manifest.json", "arrangement.json", "preview.wav",
+                  *[f"audio/{name}.wav" for name in ("drums", "bass", "chords", "melody", "pad")],
+                  *[f"midi/{name}.mid" for name in ("drums", "bass", "chords", "melody", "pad")],
+              }
+              assert required <= names, f"ZIP missing: {required - names}"
+              manifest = json.loads(zf.read("manifest.json"))
+              assert manifest["format"] == "ARRSTYLE"
+              assert manifest["settings"]["bars"] == 4
+              wav_sizes = set()
+              for name in sorted(n for n in names if n.startswith("audio/") and n.endswith(".wav")) + ["preview.wav"]:
+                  with wave.open(io.BytesIO(zf.read(name)), "rb") as w:
+                      assert w.getnchannels() == 1 and w.getsampwidth() == 2
+                      wav_sizes.add(w.getnframes())
+              assert len(wav_sizes) == 1, f"WAV duration mismatch: {wav_sizes}"
+              for name in sorted(n for n in names if n.startswith("midi/") and n.endswith(".mid")):
+                  mid = mido.MidiFile(file=io.BytesIO(zf.read(name)))
+                  assert mid.tracks, f"empty MIDI: {name}"
+              print(f"OK: {len(names)} ZIP files; all WAV stems have {next(iter(wav_sizes))} frames.")
+          PY
