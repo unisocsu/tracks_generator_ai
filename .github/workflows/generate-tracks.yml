@@ -27,8 +27,16 @@ on:
         required: true
         type: number
         default: 42
+      planner:
+        description: "Planner: local language model or built-in planner"
+        required: true
+        type: choice
+        options:
+          - local_model
+          - built_in
+        default: local_model
       lyria_preview:
-        description: "Also generate an AI music preview with Lyria 3 Clip (requires GEMINI_API_KEY)"
+        description: "Also generate an AI music preview with Lyria (requires GEMINI_API_KEY)"
         required: true
         type: boolean
         default: false
@@ -37,14 +45,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: tracks-generator-${{ github.ref }}
+  group: tracks-generator-main
   cancel-in-progress: false
 
 jobs:
   generate:
     name: Generate WAV stems, MIDI and ZIP
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,8 +64,39 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Cache local GGUF model
+        if: inputs.planner == 'local_model'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tracks-generator/models
+          key: qwen2.5-1.5b-instruct-q4km-rev-91cad511-v1
+
+      - name: Download local language model
+        if: inputs.planner == 'local_model'
+        shell: bash
+        run: |
+          set -euo pipefail
+          model_dir="$HOME/.cache/tracks-generator/models"
+          model_path="$model_dir/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+          mkdir -p "$model_dir"
+          if [ ! -f "$model_path" ] || [ "$(stat -c%s "$model_path")" -lt 1000000000 ]; then
+            rm -f "$model_path"
+            curl -fL --retry 3 --retry-delay 2 \
+              "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead5/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true" \
+              -o "$model_path"
+          fi
+          test "$(stat -c%s "$model_path")" -ge 1000000000
+          echo "TRACKS_MODEL_PATH=$model_path" >> "$GITHUB_ENV"
+          echo "Local model ready ($(du -h "$model_path" | cut -f1))."
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install local model runtime
+        if: inputs.planner == 'local_model'
+        run: python -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
       - name: Generate tracks
         env:
@@ -66,6 +105,7 @@ jobs:
           TRACKS_BPM: ${{ inputs.bpm }}
           TRACKS_BARS: ${{ inputs.bars }}
           TRACKS_SEED: ${{ inputs.seed }}
+          TRACKS_PLANNER: ${{ inputs.planner }}
           TRACKS_LYRIA_PREVIEW: ${{ inputs.lyria_preview }}
         run: |
           python scripts/generate_tracks.py \
@@ -73,41 +113,48 @@ jobs:
             --bpm "$TRACKS_BPM" \
             --bars "$TRACKS_BARS" \
             --seed "$TRACKS_SEED" \
+            --planner "$TRACKS_PLANNER" \
             --output output \
             $( [ "$TRACKS_LYRIA_PREVIEW" = "true" ] && printf '%s' '--lyria' )
 
       - name: Validate generated package
         run: |
           python - <<'PY'
+          import io
           import json
           import wave
           import zipfile
           from pathlib import Path
+          import mido
 
-          root = Path("output")
-          package = root / "tracks-generator.zip"
+          package = Path("output/tracks-generator.zip")
           assert package.is_file(), "ZIP was not created"
           with zipfile.ZipFile(package) as zf:
               names = set(zf.namelist())
-              for required in (
+              required = (
                   "manifest.json", "arrangement.json", "preview.wav",
                   "audio/drums.wav", "audio/bass.wav", "audio/chords.wav",
                   "audio/melody.wav", "audio/pad.wav",
                   "midi/drums.mid", "midi/bass.mid", "midi/chords.mid",
                   "midi/melody.mid", "midi/pad.mid",
-              ):
-                  assert required in names, f"Missing in ZIP: {required}"
+              )
+              for name in required:
+                  assert name in names, f"Missing in ZIP: {name}"
               manifest = json.loads(zf.read("manifest.json"))
               assert manifest["format"] == "ARRSTYLE"
-              wave_info = []
-              for name in sorted(n for n in names if n.startswith("audio/") and n.endswith(".wav")):
-                  import io
+              assert manifest["settings"]["bpm"] >= 45
+              assert manifest["generation"]["planner"] in (
+                  "local-qwen2.5-1.5b-instruct", "built-in-fallback"
+              )
+              wav_lengths = set()
+              for name in sorted(n for n in names if n.endswith(".wav")):
                   with wave.open(io.BytesIO(zf.read(name)), "rb") as w:
-                      wave_info.append((name, w.getnframes(), w.getframerate(), w.getnchannels()))
-              assert wave_info, "No WAV stems found"
-              lengths = {frames for _, frames, _, _ in wave_info}
-              assert len(lengths) == 1, f"WAV stems do not have the same length: {wave_info}"
-              print(f"Validated {len(names)} files; WAV stems share {next(iter(lengths))} frames.")
+                      assert w.getnchannels() == 1 and w.getsampwidth() == 2
+                      wav_lengths.add(w.getnframes())
+              assert len(wav_lengths) == 1, f"WAV duration mismatch: {wav_lengths}"
+              for name in sorted(n for n in names if n.startswith("midi/") and n.endswith(".mid")):
+                  assert mido.MidiFile(file=io.BytesIO(zf.read(name))).tracks
+              print(f"Validated {len(names)} files. Planner: {manifest['generation']['planner']}.")
           PY
 
       - name: Upload ZIP artifact
