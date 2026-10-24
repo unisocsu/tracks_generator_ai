@@ -46,39 +46,78 @@ def parse_chord(symbol):
     return root % 12, ints
 
 
-def get_plan(prompt, bpm, bars, seed):
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    raw = None
-    if key:
-        task = (
-            "Return JSON only for a short keyboard accompaniment loop. Keep it instrumental. "
-            "Return keys title, genre, mood, key, chord_progression, groove, melody_density, notes. "
-            "Use one chord per bar and these grooves: " + ", ".join(GROOVES) + ". "
-            "Chord examples: Am, F, C, G, Dm, E7, Bb, Gmaj7."
-            + chr(10) + "Prompt: " + prompt + chr(10)
-            + "Tempo: " + str(bpm) + " BPM, meter 4/4, exactly " + str(bars) + " bars, seed " + str(seed) + "."
-            + chr(10) + 'Example JSON: {"title":"Keyboard Groove","genre":"pop","mood":"upbeat","key":"Am",'
-            + '"chord_progression":["Am","F","C","G"],"groove":"pop_rock","melody_density":2,"notes":"brief note"}'
+def get_local_plan(prompt, bpm, bars, seed, model_path):
+    """Use a locally stored GGUF model to produce an arrangement plan."""
+    path = Path(model_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError("Local model file not found: " + str(path))
+    try:
+        from llama_cpp import Llama
+    except ImportError as exc:
+        raise RuntimeError("Local planning requires llama-cpp-python.") from exc
+
+    system_prompt = (
+        "You are an expert arranger-keyboard accompaniment planner. "
+        "Return one valid JSON object only, without Markdown. Required keys: title, genre, "
+        "mood, key, chord_progression, groove, melody_density, notes. "
+        "Return exactly one chord symbol per bar. Allowed grooves: " + ", ".join(GROOVES) + ". "
+        "Use simple chord symbols such as Am, F, C, G, Dm, E7, Bb, Gmaj7. "
+        "melody_density must be an integer from 1 to 4. The arrangement is instrumental."
+    )
+    user_prompt = (
+        "Create a keyboard accompaniment plan for: " + prompt + "\n"
+        + "Tempo: " + str(bpm) + " BPM; meter 4/4; bars: " + str(bars)
+        + "; seed: " + str(seed) + ". Return exactly " + str(bars)
+        + " chord symbols in chord_progression."
+    )
+    model = Llama(
+        model_path=str(path),
+        n_ctx=4096,
+        n_threads=max(2, min(4, os.cpu_count() or 2)),
+        n_batch=256,
+        verbose=False,
+    )
+    try:
+        result = model.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=900,
+            seed=seed,
         )
-        body = {"contents": [{"role": "user", "parts": [{"text": task}]}],
-                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7, "maxOutputTokens": 1000}}
-        req = urllib.request.Request(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
+        raw = json.loads(result["choices"][0]["message"]["content"])
+        if not isinstance(raw, dict):
+            raise ValueError("Local model response was not a JSON object")
+        return raw
+    finally:
+        del model
+
+
+def get_plan(prompt, bpm, bars, seed, model_path=None, planner_mode="auto"):
+    raw = None
+    planner_mode = (planner_mode or "auto").strip().lower()
+    if planner_mode not in ("auto", "local_model", "built_in"):
+        raise ValueError("planner must be auto, local_model, or built_in")
+    if planner_mode == "local_model" and not model_path:
+        raise ValueError("Local planner selected but TRACKS_MODEL_PATH / --model-path is missing.")
+
+    if planner_mode != "built_in" and model_path:
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
-                result = json.loads(response.read().decode())
-            text = "".join(p.get("text", "") for p in result["candidates"][0]["content"]["parts"] if p.get("text")).strip()
-            raw = json.loads(text)
-            if not isinstance(raw, dict):
-                raw = None
-            else:
-                print("Gemini arrangement plan received.")
+            print("Loading local language model: " + str(Path(model_path).expanduser()))
+            raw = get_local_plan(prompt, bpm, bars, seed, model_path)
+            print("Local model arrangement plan received.")
         except Exception as exc:
-            print("Gemini planner unavailable (" + type(exc).__name__ + "); using built-in arrangement.")
+            if planner_mode == "local_model":
+                raise RuntimeError("Local model planning failed (" + type(exc).__name__ + "): " + str(exc)) from exc
+            print("Local model unavailable (" + type(exc).__name__ + "); using built-in arrangement.")
+    elif planner_mode == "auto":
+        print("No local model path configured; using built-in arrangement.")
     else:
-        print("GEMINI_API_KEY missing; using built-in arrangement.")
+        print("Built-in planner selected.")
+
     fallback = ["Am", "F", "C", "G"] if "minor" not in prompt.lower() else ["Am", "F", "Dm", "E7"]
     fallback = [fallback[i % len(fallback)] for i in range(bars)]
     chords = raw.get("chord_progression") if raw and isinstance(raw.get("chord_progression"), list) else fallback
@@ -100,10 +139,9 @@ def get_plan(prompt, bpm, bars, seed):
         "key": str(raw.get("key", chords[0]) if raw else chords[0])[:20],
         "prompt": prompt, "bpm": bpm, "meter": "4/4", "bars": bars, "seed": seed,
         "groove": groove, "chord_progression": chords, "melody_density": density,
-        "planner": "gemini-3.8-flash" if raw else "built-in-fallback",
+        "planner": "local-qwen2.5-1.5b-instruct" if raw else "built-in-fallback",
         "sections": [{"name": "Main A", "start_bar": 0, "bars": bars}]
     }
-
 
 def build_events(plan):
     out = {n: [] for n in NAMES}
@@ -267,8 +305,8 @@ def create_package(package, out, plan):
     return archive
 
 
-def generate(prompt, bpm, bars, seed, out, use_lyria):
-    plan = get_plan(prompt, bpm, bars, seed)
+def generate(prompt, bpm, bars, seed, out, use_lyria, model_path=None, planner_mode="auto"):
+    plan = get_plan(prompt, bpm, bars, seed, model_path, planner_mode)
     package = out / "package"
     if package.exists():
         import shutil
@@ -304,12 +342,14 @@ def main():
     p.add_argument("--bars", type=int, default=int(os.environ.get("TRACKS_BARS", "4")))
     p.add_argument("--seed", type=int, default=int(os.environ.get("TRACKS_SEED", "42")))
     p.add_argument("--output", type=Path, default=Path("output"))
+    p.add_argument("--model-path", default=os.environ.get("TRACKS_MODEL_PATH", ""))
+    p.add_argument("--planner", choices=("auto", "local_model", "built_in"), default=os.environ.get("TRACKS_PLANNER", "auto"))
     p.add_argument("--lyria", action="store_true")
     a = p.parse_args()
     if not a.prompt.strip(): p.error("prompt cannot be empty")
     if not 45 <= a.bpm <= 220: p.error("BPM must be 45-220")
     if not 1 <= a.bars <= 16: p.error("bars must be 1-16")
-    try: generate(a.prompt.strip(), a.bpm, a.bars, a.seed, a.output.resolve(), a.lyria)
+    try: generate(a.prompt.strip(), a.bpm, a.bars, a.seed, a.output.resolve(), a.lyria, a.model_path or None, a.planner)
     except Exception as exc:
         print("Generation failed: " + type(exc).__name__ + ": " + str(exc), file=sys.stderr)
         return 1
